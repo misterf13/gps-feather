@@ -6,10 +6,13 @@
 
 // Set GPSECHO to 'false' to turn off echoing the GPS data to the Serial console
 // Set to 'true' if you want to debug and listen to the raw GPS sentences
-#define GPSECHO false
+#define GPSECHO true
 
 // Enable or disable ADA_IO
-#define ADA_IO false
+#define ADA_IO true
+
+// Time to try to connect to Adafruit IO
+#define MAX_IO_RETRY 10
 
 /************************** Configuration ***********************************/
 // edit the config.h tab and enter your Adafruit IO credentials
@@ -17,8 +20,12 @@
 // or ethernet clients.
 #if ADA_IO
 #include "config.h"
-// set up the ESP32 feed as 'esp_feed'
-AdafruitIO_Feed *esp_feed = io.feed("ESP32_volts");
+// set up the ESP32 feed as 'esp_feed' and GPS info as location
+AdafruitIO_Feed *esp_feed   = io.feed("ESP32_volts");
+AdafruitIO_Feed *location   = io.feed("ESP32_GPS");
+bool             io_enabled = true;
+#else
+bool             io_enabled = false;
 #endif
 
 #define VBATPIN A13
@@ -33,7 +40,8 @@ Adafruit_GPS GPS(&GPSSerial);
 Adafruit_SSD1306 display = Adafruit_SSD1306(128, 32, &Wire);
 
 uint32_t timer       = millis();
-uint32_t timer_delay = 1000;
+uint32_t timer_delay = 500;
+int      io_retries  = 0;
 
 #if defined(ESP32)
   #define BUTTON_A 15
@@ -109,7 +117,13 @@ void setup() {
   while(io.status() < AIO_CONNECTED) {
     display.print(".");
     display.display();
-    delay(200);
+    delay(250);
+    io_retries++;
+    // Figure out how to fail out properly.
+    if (io_retries > MAX_IO_RETRY) {
+      io_enabled = false;
+      break;
+    }
   }
   
   // we are connected
@@ -123,16 +137,28 @@ void setup() {
   display.display();
 }
 
-int display_msg = 0;
+int      display_msg = 0;
+int      io_counter  = 0;
+uint32_t gps_counter = 0;
 
 void loop() {
-#if ADA_IO
-  // We need this but it causes delays. Comment out for now.
-  //io.run();
-#endif
+  float volt_read;
   if(!digitalRead(BUTTON_A)) display_msg = 0;
   if(!digitalRead(BUTTON_B)) display_msg = 1;
   if(!digitalRead(BUTTON_C)) display_msg = 2;
+
+  // To convert the ADC integer value to a real voltage you’ll need to divide it by
+  // the maximum value of 4096, then double it (note above that Adafruit halves the voltage),
+  // then multiply that by the reference voltage of the ESP32 which is 3.3V and then vinally,
+  // multiply that again by the ADC Reference Voltage of 1100mV.
+  volt_read = (float)analogRead(VBATPIN) / (1<<A_RES) * 2.0 * 3.3 * 1.1;
+  //float volt_read = ((float)analogRead(VBATPIN) * 2.0 * 3.3) / (1<<A_RES);
+  // Voltage is off by .20 according to multimeter or .10 if wifi enabled.
+  if (io_enabled) {
+    volt_read += 0.10;
+  } else {
+    volt_read += 0.20;
+  }
   
   // read data from the GPS in the 'main loop'
   char c = GPS.read();
@@ -148,26 +174,39 @@ void loop() {
     if (!GPS.parse(GPS.lastNMEA())) // this also sets the newNMEAreceived() flag to false
       return; // we can fail to parse a sentence in which case we should just wait for another
   }
+  
   // if millis() or timer wraps around, we'll just reset it
   if (timer > millis()) timer = millis();
      
   // approximately every second or so, print out the current stats
   if (millis() - timer > timer_delay) {
     timer = millis(); // reset the timer
+#if ADA_IO
+  if (io_enabled) {
+    // When counter reaches 9 we will send io data. In this case if timer_delay = .5 sec
+    // we send io data every 10 seconds.
+    if (io_counter > 9) {
+      esp_feed->save(volt_read);
+      location->save(gps_counter, GPS.latitudeDegrees, GPS.longitudeDegrees, GPS.altitude);
+      gps_counter++;
+      io_counter = 0;
+    }
+  }
+#endif
     if (display_msg == 0) {
-      timer_delay = 1000;
       msg_1();
     } else if (display_msg == 1) {
-#if ADA_IO
-      // We set timer_delay to 2 seconds to avide by adafruit.io rules
-      timer_delay = 2000;
-#endif
-      msg_2();
+      msg_2(volt_read);
     } else if (display_msg == 2) {
-      timer_delay = 1000;
       msg_3();
     }
     display.display();
+#if ADA_IO
+  if (io_enabled) {
+    io.run();
+    io_counter++;
+  }
+#endif
     display.clearDisplay();
     display.setCursor(0,0);
   }
@@ -193,12 +232,14 @@ void msg_1() {
     display.println((char)1);
     display.print("Time is good."); display.println((char)2);
 #if ADA_IO
-    display.print("IP: "); display.println(WiFi.localIP());
+    if (io_enabled) {
+      display.print("IP: "); display.println(WiFi.localIP());
+    }
 #endif
   }
 }
 
-void msg_2() {
+void msg_2(float volt_read) {
   display.print("Date: ");
   display.print(GPS.month, DEC); display.print("/");
   display.print(GPS.day, DEC); display.print("/20");
@@ -210,21 +251,9 @@ void msg_2() {
   display.print(GPS.minute, DEC); display.print(':');
   if (GPS.seconds < 10) display.print(0);
   display.print(GPS.seconds, DEC); display.println(" UTC");
-  // To convert the ADC integer value to a real voltage you’ll need to divide it by
-  // the maximum value of 4096, then double it (note above that Adafruit halves the voltage),
-  // then multiply that by the reference voltage of the ESP32 which is 3.3V and then vinally,
-  // multiply that again by the ADC Reference Voltage of 1100mV.
-  float volt_read = (float)analogRead(VBATPIN) / (1<<A_RES) * 2.0 * 3.3 * 1.1;
-  //float volt_read = ((float)analogRead(VBATPIN) * 2.0 * 3.3) / (1<<A_RES);
-  // Voltage is off by .20 according to multimeter
-  volt_read += 0.20;
-#if ADA_IO
-  esp_feed->save(volt_read);
-#endif
-  Serial.print("Voltage: "); Serial.print(volt_read, 2); Serial.println("v");
   display.print("Voltage: "); display.print(volt_read, 2); display.println("v");
   display.print("E[");
-  for (float volts = 3.20; volts <= 4.10; volts += 0.10) {
+  for (float volts = 3.30; volts <= 4.20; volts += 0.10) {
     if (volt_read >= volts) {
       display.print((char)(218));
     } else {
@@ -236,9 +265,9 @@ void msg_2() {
 
 void msg_3() {
   display.print("Lat: ");
-  display.print(GPS.latitude, 4); display.println(GPS.lat);
+  display.print(GPS.lat); display.print(" "); display.println(GPS.latitudeDegrees, 6);
   display.print("Lon: ");
-  display.print(GPS.longitude, 4); display.println(GPS.lon);
+  display.print(GPS.lon); display.print(" "); display.println(GPS.longitudeDegrees, 6);
   display.print("Spd: "); display.print((float)GPS.speed * 1.15078); display.println(" mph");
   display.print("Alt: "); display.print(GPS.altitude); display.println(" m");
 }
